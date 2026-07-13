@@ -1,0 +1,46 @@
+[
+  {
+    "id": "mock-1",
+    "title": "Rhone Glacier Retreat (Before)",
+    "description": "A historical archive photo of the Rhone Glacier in Switzerland showing extensive ice cover.",
+    "date": "1900-07-15",
+    "lat": 46.598,
+    "lng": 8.384,
+    "imageUrl": "https://images.unsplash.com/photo-1548625361-155de0cbb55a?auto=format&fit=crop&w=800&q=80",
+    "category": "Glacier Melt",
+    "author": "Archive"
+  },
+  {
+    "id": "mock-2",
+    "title": "Rhone Glacier Retreat (After)",
+    "description": "Modern view of the Rhone Glacier, showing dramatic volume loss and glacial lake formation due to global warming.",
+    "date": "2020-08-20",
+    "lat": 46.598,
+    "lng": 8.384,
+    "imageUrl": "https://images.unsplash.com/photo-1504280390367-361c6d9f38f4?auto=format&fit=crop&w=800&q=80",
+    "category": "Glacier Melt",
+    "author": "Researcher"
+  },
+  {
+    "id": "mock-3",
+    "title": "Lake Mead Water Depletion (Before)",
+    "description": "Water levels at Lake Mead, Nevada, near capacity prior to the prolonged Southwest drought.",
+    "date": "1985-06-10",
+    "lat": 36.012,
+    "lng": -114.737,
+    "imageUrl": "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=800&q=80",
+    "category": "Drought",
+    "author": "Archive"
+  },
+  {
+    "id": "mock-4",
+    "title": "Lake Mead Water Depletion (After)",
+    "description": "Lake Mead water levels at historic lows, exposing the \"bathtub ring\" and illustrating long-term climate pressure.",
+    "date": "2022-09-01",
+    "lat": 36.012,
+    "lng": -114.737,
+    "imageUrl": "https://images.unsplash.com/photo-1547036967-23d11aacaee0?auto=format&fit=crop&w=800&q=80",
+    "category": "Drought",
+    "author": "Local Contributor"
+  }
+]
