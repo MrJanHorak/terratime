@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
   TrendingUp,
   Image as ImageIcon,
@@ -38,6 +38,82 @@ interface ClimateDashboardProps {
   onClose: () => void;
 }
 
+// Earliest year the archive API reasonably has good coverage for.
+const EARLIEST_YEAR = 1950;
+
+// Group raw daily records from the API into per-year aggregates.
+function computeYearlyTrends(daily: {
+  time: string[];
+  temperature_2m_max: (number | null)[];
+  temperature_2m_min: (number | null)[];
+  precipitation_sum: (number | null)[];
+  wind_speed_10m_max: (number | null)[];
+}): HistoricalTrend[] {
+  const grouped: Record<number, { temps: number[]; precips: number[]; winds: number[] }> = {};
+
+  for (let i = 0; i < daily.time.length; i++) {
+    const dateStr = daily.time[i];
+    const year = new Date(dateStr).getFullYear();
+    if (!grouped[year]) {
+      grouped[year] = { temps: [], precips: [], winds: [] };
+    }
+
+    const tempMax = daily.temperature_2m_max[i];
+    const tempMin = daily.temperature_2m_min[i];
+    if (tempMax !== undefined && tempMax !== null && tempMin !== undefined && tempMin !== null) {
+      grouped[year].temps.push((tempMax + tempMin) / 2);
+    }
+    if (daily.precipitation_sum[i] !== undefined && daily.precipitation_sum[i] !== null) {
+      grouped[year].precips.push(daily.precipitation_sum[i] as number);
+    }
+    if (daily.wind_speed_10m_max[i] !== undefined && daily.wind_speed_10m_max[i] !== null) {
+      grouped[year].winds.push(daily.wind_speed_10m_max[i] as number);
+    }
+  }
+
+  return Object.keys(grouped)
+    .map((yrStr) => {
+      const yr = parseInt(yrStr);
+      const vals = grouped[yr];
+
+      const avgTemp =
+        vals.temps.length > 0 ? vals.temps.reduce((a, b) => a + b, 0) / vals.temps.length : 0;
+      const totalPrecip = vals.precips.length > 0 ? vals.precips.reduce((a, b) => a + b, 0) : 0;
+      const maxWind = vals.winds.length > 0 ? Math.max(...vals.winds) : 0;
+
+      return {
+        year: yr,
+        avgTemp: parseFloat(avgTemp.toFixed(2)),
+        totalPrecip: parseFloat(totalPrecip.toFixed(1)),
+        maxWind: parseFloat(maxWind.toFixed(1))
+      };
+    })
+    .sort((a, b) => a.year - b.year);
+}
+
+// Simple linear regression slope for a series of {year, value} points.
+function computeSlope(points: { year: number; value: number }[]): number {
+  const n = points.length;
+  if (n < 2) return 0;
+
+  let sumX = 0,
+    sumY = 0,
+    sumXY = 0,
+    sumXX = 0;
+
+  points.forEach((p) => {
+    sumX += p.year;
+    sumY += p.value;
+    sumXY += p.year * p.value;
+    sumXX += p.year * p.year;
+  });
+
+  const denominator = n * sumXX - sumX * sumX;
+  if (denominator === 0) return 0;
+
+  return (n * sumXY - sumX * sumY) / denominator;
+}
+
 export default function ClimateDashboard({
   location,
   contributions,
@@ -47,9 +123,13 @@ export default function ClimateDashboard({
   const [activeTab, setActiveTab] = useState<"trends" | "photos" | "upload">("trends");
   const [mounted, setMounted] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [trendData, setTrendData] = useState<TrendAnalysisResult | null>(null);
+  const [fetchError, setFetchError] = useState(false);
 
-  // Timeframe selector for trends
+  // Full, unfiltered per-year history for the current location.
+  // Fetched once per location change, never per timeframe change.
+  const [fullTrends, setFullTrends] = useState<HistoricalTrend[] | null>(null);
+
+  // Timeframe selector for trends (purely client-side slicing now)
   const [timeframe, setTimeframe] = useState({ start: 1980, end: 2025 });
 
   // Photo uploads
@@ -71,114 +151,117 @@ export default function ClimateDashboard({
   const sliderContainerRef = useRef<HTMLDivElement>(null);
 
   // Filter contributions by location proximity (within ~1.0 degree)
-  const localContributions = contributions.filter(
-    (c) =>
-      Math.abs(c.lat - location.latitude) < 1.0 &&
-      Math.abs(c.lng - location.longitude) < 1.0
-  ).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+  const localContributions = contributions
+    .filter(
+      (c) =>
+        Math.abs(c.lat - location.latitude) < 1.0 && Math.abs(c.lng - location.longitude) < 1.0
+    )
+    .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
   useEffect(() => {
     setMounted(true);
   }, []);
 
-  // Fetch and calculate climate trends
+  // Tracks the last coordinate pair we actually fetched, so re-renders that
+  // produce a new `location` object (same lat/lng, different reference)
+  // don't trigger a duplicate network call.
+  const lastFetchedKeyRef = useRef<string | null>(null);
+
+  // Fetch the FULL history for a location exactly once per *distinct*
+  // coordinate pair. Timeframe changes never trigger a refetch — see the
+  // useMemo below instead.
+  //
+  // IMPORTANT: this depends on the primitive lat/lng values, not the
+  // `location` object itself. If the parent component recreates the
+  // `location` object on every render (e.g. `location={{ latitude, longitude, name }}`
+  // built inline from other state), a `[location]` dependency would fire
+  // this effect on every parent re-render even though the coordinates
+  // haven't changed — that's a common cause of rapid-fire requests and
+  // 429s. Depending on the primitives avoids that entirely.
   useEffect(() => {
-    const fetchTrends = async () => {
+    const key = `${location.latitude.toFixed(4)},${location.longitude.toFixed(4)}`;
+
+    // Skip if we've already fetched (or are fetching) this exact location.
+    if (lastFetchedKeyRef.current === key) {
+      return;
+    }
+    lastFetchedKeyRef.current = key;
+
+    const abortController = new AbortController();
+
+    const fetchFullHistory = async () => {
       setLoading(true);
+      setFetchError(false);
       try {
+        // The archive API only has data up through a few days ago — asking
+        // for a future end_date returns a 400. Clamp to yesterday.
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const endDateStr = yesterday.toISOString().split("T")[0];
+
         const response = await fetch(
-          `https://archive-api.open-meteo.com/v1/archive?latitude=${location.latitude}&longitude=${location.longitude}&start_date=${timeframe.start}-01-01&end_date=${timeframe.end}-12-31&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max&timezone=auto`
+          `https://archive-api.open-meteo.com/v1/archive?latitude=${location.latitude}&longitude=${location.longitude}&start_date=${EARLIEST_YEAR}-01-01&end_date=${endDateStr}&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max&timezone=auto`,
+          { signal: abortController.signal }
         );
+
+        if (response.status === 429) {
+          throw new Error("Rate limited by archive API (429) — try again shortly.");
+        }
+        if (!response.ok) {
+          throw new Error(`Archive API returned ${response.status}`);
+        }
+
         const data = await response.json();
 
         if (data.daily) {
-          const daily = data.daily;
-          const grouped: Record<number, { temps: number[]; precips: number[]; winds: number[] }> = {};
-
-          // Group daily data by year
-          for (let i = 0; i < daily.time.length; i++) {
-            const dateStr = daily.time[i];
-            const year = new Date(dateStr).getFullYear();
-            if (!grouped[year]) {
-              grouped[year] = { temps: [], precips: [], winds: [] };
-            }
-
-            const tempMax = daily.temperature_2m_max[i];
-            const tempMin = daily.temperature_2m_min[i];
-            if (tempMax !== undefined && tempMin !== undefined) {
-              grouped[year].temps.push((tempMax + tempMin) / 2);
-            }
-            if (daily.precipitation_sum[i] !== undefined) {
-              grouped[year].precips.push(daily.precipitation_sum[i]);
-            }
-            if (daily.wind_speed_10m_max[i] !== undefined) {
-              grouped[year].winds.push(daily.wind_speed_10m_max[i]);
-            }
-          }
-
-          // Compute yearly metrics
-          const trends: HistoricalTrend[] = Object.keys(grouped).map((yrStr) => {
-            const yr = parseInt(yrStr);
-            const vals = grouped[yr];
-            
-            const avgTemp = vals.temps.length > 0 
-              ? vals.temps.reduce((a, b) => a + b, 0) / vals.temps.length 
-              : 0;
-            const totalPrecip = vals.precips.length > 0 
-              ? vals.precips.reduce((a, b) => a + b, 0) 
-              : 0;
-            const maxWind = vals.winds.length > 0 
-              ? Math.max(...vals.winds) 
-              : 0;
-
-            return {
-              year: yr,
-              avgTemp: parseFloat(avgTemp.toFixed(2)),
-              totalPrecip: parseFloat(totalPrecip.toFixed(1)),
-              maxWind: parseFloat(maxWind.toFixed(1))
-            };
-          }).sort((a, b) => a.year - b.year);
-
-          // Linear regression for temperature (warming slope)
-          // y = mx + c
-          const n = trends.length;
-          let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-          let sumPrecipY = 0, sumPrecipXY = 0;
-
-          trends.forEach((t) => {
-            const x = t.year;
-            sumX += x;
-            sumY += t.avgTemp;
-            sumPrecipY += t.totalPrecip;
-            sumXY += x * t.avgTemp;
-            sumPrecipXY += x * t.totalPrecip;
-            sumXX += x * x;
-          });
-
-          const tempSlope = n > 1 
-            ? (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX) 
-            : 0;
-          const precipSlope = n > 1 
-            ? (n * sumPrecipXY - sumX * sumPrecipY) / (n * sumXX - sumX * sumX) 
-            : 0;
-
-          setTrendData({
-            trends,
-            tempSlope: parseFloat(tempSlope.toFixed(4)),
-            precipSlope: parseFloat(precipSlope.toFixed(4)),
-            startYear: timeframe.start,
-            endYear: timeframe.end
-          });
+          setFullTrends(computeYearlyTrends(data.daily));
+        } else {
+          setFullTrends([]);
+          setFetchError(true);
         }
       } catch (error) {
-        console.error("Error calculating trends:", error);
+        // Ignore errors from requests we intentionally aborted (e.g. the
+        // user moved to a new location before this one finished).
+        if ((error as Error).name === "AbortError") return;
+
+        console.error("Error fetching climate history:", error);
+        setFullTrends(null);
+        setFetchError(true);
+        // Allow a retry for this same location on next attempt (e.g. if the
+        // user re-triggers a fetch), rather than permanently locking it out.
+        lastFetchedKeyRef.current = null;
       } finally {
-        setLoading(false);
+        if (!abortController.signal.aborted) {
+          setLoading(false);
+        }
       }
     };
 
-    fetchTrends();
-  }, [location, timeframe]);
+    fetchFullHistory();
+
+    return () => {
+      abortController.abort();
+    };
+  }, [location.latitude, location.longitude]);
+
+  // Slice the cached full history down to the selected timeframe and
+  // recompute the regression. Pure client-side math — no network call.
+  const trendData: TrendAnalysisResult | null = useMemo(() => {
+    if (!fullTrends) return null;
+
+    const trends = fullTrends.filter((t) => t.year >= timeframe.start && t.year <= timeframe.end);
+
+    const tempSlope = computeSlope(trends.map((t) => ({ year: t.year, value: t.avgTemp })));
+    const precipSlope = computeSlope(trends.map((t) => ({ year: t.year, value: t.totalPrecip })));
+
+    return {
+      trends,
+      tempSlope: parseFloat(tempSlope.toFixed(4)),
+      precipSlope: parseFloat(precipSlope.toFixed(4)),
+      startYear: timeframe.start,
+      endYear: timeframe.end
+    };
+  }, [fullTrends, timeframe]);
 
   // Handle Before/After split image dragging
   const handleSplitMove = (clientX: number) => {
@@ -260,8 +343,8 @@ export default function ClimateDashboard({
     }
   };
 
-  const currentWarming = trendData 
-    ? (trendData.tempSlope * (trendData.endYear - trendData.startYear)).toFixed(1) 
+  const currentWarming = trendData
+    ? (trendData.tempSlope * (trendData.endYear - trendData.startYear)).toFixed(1)
     : "0.0";
 
   return (
@@ -324,32 +407,38 @@ export default function ClimateDashboard({
 
       {/* Content Area */}
       <div className="flex-1 overflow-y-auto p-4 flex flex-col gap-4 text-left">
-        
         {/* TAB 1: CLIMATE TRENDS */}
         {activeTab === "trends" && (
           <div className="flex flex-col gap-4">
-            
             {/* Timeframe settings */}
             <div className="flex items-center justify-between text-xs glass-card p-2.5">
               <span className="text-gray-400">Analysis Range:</span>
               <div className="flex items-center gap-1">
                 <select
                   value={timeframe.start}
-                  onChange={(e) => setTimeframe(prev => ({ ...prev, start: parseInt(e.target.value) }))}
+                  onChange={(e) =>
+                    setTimeframe((prev) => ({ ...prev, start: parseInt(e.target.value) }))
+                  }
                   className="bg-transparent text-white border border-panel-border rounded px-1.5 py-0.5 outline-none cursor-pointer"
                 >
-                  {[1950, 1960, 1970, 1980, 1990, 2000].map(y => (
-                    <option key={y} value={y} className="bg-background">{y}</option>
+                  {[1950, 1960, 1970, 1980, 1990, 2000].map((y) => (
+                    <option key={y} value={y} className="bg-background">
+                      {y}
+                    </option>
                   ))}
                 </select>
                 <ArrowRight className="w-3 h-3 text-gray-500 mx-1" />
                 <select
                   value={timeframe.end}
-                  onChange={(e) => setTimeframe(prev => ({ ...prev, end: parseInt(e.target.value) }))}
+                  onChange={(e) =>
+                    setTimeframe((prev) => ({ ...prev, end: parseInt(e.target.value) }))
+                  }
                   className="bg-transparent text-white border border-panel-border rounded px-1.5 py-0.5 outline-none cursor-pointer"
                 >
-                  {[2010, 2015, 2020, 2025, 2026].map(y => (
-                    <option key={y} value={y} className="bg-background">{y}</option>
+                  {[2010, 2015, 2020, 2025, 2026].map((y) => (
+                    <option key={y} value={y} className="bg-background">
+                      {y}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -362,7 +451,6 @@ export default function ClimateDashboard({
               </div>
             ) : trendData ? (
               <div className="flex flex-col gap-5">
-                
                 {/* Stats Summary */}
                 <div className="grid grid-cols-2 gap-3">
                   <div className="glass-card p-3 flex flex-col gap-1">
@@ -384,10 +472,14 @@ export default function ClimateDashboard({
                       Precipitation Slope
                     </span>
                     <span className="text-xl font-bold text-blue-400">
-                      {(trendData.precipSlope * (trendData.endYear - trendData.startYear)).toFixed(0)} mm
+                      {(trendData.precipSlope * (trendData.endYear - trendData.startYear)).toFixed(
+                        0
+                      )}{" "}
+                      mm
                     </span>
                     <span className="text-[9px] text-gray-500 leading-tight">
-                      Trend: {trendData.precipSlope > 0 ? "Wetter" : "Drier"} ({(trendData.precipSlope * 10).toFixed(1)}mm/decade)
+                      Trend: {trendData.precipSlope > 0 ? "Wetter" : "Drier"} (
+                      {(trendData.precipSlope * 10).toFixed(1)}mm/decade)
                     </span>
                   </div>
                 </div>
@@ -401,12 +493,24 @@ export default function ClimateDashboard({
                   <div className="h-44 w-full">
                     {mounted && (
                       <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={trendData.trends} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                        <LineChart
+                          data={trendData.trends}
+                          margin={{ top: 5, right: 5, left: -20, bottom: 5 }}
+                        >
                           <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                           <XAxis dataKey="year" stroke="#4b5563" fontSize={10} tickLine={false} />
-                          <YAxis stroke="#4b5563" fontSize={10} domain={["auto", "auto"]} tickLine={false} />
+                          <YAxis
+                            stroke="#4b5563"
+                            fontSize={10}
+                            domain={["auto", "auto"]}
+                            tickLine={false}
+                          />
                           <Tooltip
-                            contentStyle={{ background: "rgba(10,10,20,0.85)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: "8px" }}
+                            contentStyle={{
+                              background: "rgba(10,10,20,0.85)",
+                              border: "1px solid rgba(255,255,255,0.1)",
+                              borderRadius: "8px"
+                            }}
                             labelClassName="text-[10px] text-gray-400"
                             itemStyle={{ fontSize: "12px", color: "#f87171" }}
                           />
@@ -433,16 +537,29 @@ export default function ClimateDashboard({
                   <div className="h-44 w-full">
                     {mounted && (
                       <ResponsiveContainer width="100%" height="100%">
-                        <BarChart data={trendData.trends} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                        <BarChart
+                          data={trendData.trends}
+                          margin={{ top: 5, right: 5, left: -20, bottom: 5 }}
+                        >
                           <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                           <XAxis dataKey="year" stroke="#4b5563" fontSize={10} tickLine={false} />
                           <YAxis stroke="#4b5563" fontSize={10} tickLine={false} />
                           <Tooltip
-                            contentStyle={{ background: "rgba(10,10,20,0.85)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: "8px" }}
+                            contentStyle={{
+                              background: "rgba(10,10,20,0.85)",
+                              border: "1px solid rgba(255,255,255,0.1)",
+                              borderRadius: "8px"
+                            }}
                             labelClassName="text-[10px] text-gray-400"
                             itemStyle={{ fontSize: "12px", color: "#60a5fa" }}
                           />
-                          <Bar dataKey="totalPrecip" name="Rain/Snow" fill="#3b82f6" opacity={0.6} radius={[2, 2, 0, 0]} />
+                          <Bar
+                            dataKey="totalPrecip"
+                            name="Rain/Snow"
+                            fill="#3b82f6"
+                            opacity={0.6}
+                            radius={[2, 2, 0, 0]}
+                          />
                         </BarChart>
                       </ResponsiveContainer>
                     )}
@@ -458,16 +575,30 @@ export default function ClimateDashboard({
                   <div className="h-44 w-full">
                     {mounted && (
                       <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={trendData.trends} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
+                        <LineChart
+                          data={trendData.trends}
+                          margin={{ top: 5, right: 5, left: -20, bottom: 5 }}
+                        >
                           <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
                           <XAxis dataKey="year" stroke="#4b5563" fontSize={10} tickLine={false} />
                           <YAxis stroke="#4b5563" fontSize={10} tickLine={false} />
                           <Tooltip
-                            contentStyle={{ background: "rgba(10,10,20,0.85)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: "8px" }}
+                            contentStyle={{
+                              background: "rgba(10,10,20,0.85)",
+                              border: "1px solid rgba(255,255,255,0.1)",
+                              borderRadius: "8px"
+                            }}
                             labelClassName="text-[10px] text-gray-400"
                             itemStyle={{ fontSize: "12px", color: "#34d399" }}
                           />
-                          <Line type="monotone" dataKey="maxWind" name="Peak Wind" stroke="#34d399" strokeWidth={1.5} dot={false} />
+                          <Line
+                            type="monotone"
+                            dataKey="maxWind"
+                            name="Peak Wind"
+                            stroke="#34d399"
+                            strokeWidth={1.5}
+                            dot={false}
+                          />
                         </LineChart>
                       </ResponsiveContainer>
                     )}
@@ -477,12 +608,17 @@ export default function ClimateDashboard({
                 <div className="glass-card p-3 flex gap-2.5 items-start bg-blue-950/20 text-xs border-blue-900/40">
                   <Info className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
                   <p className="text-gray-400 leading-normal">
-                    This linear regression models localized climate variables from Copernicus ERA5 datasets. Slopes measure structural deviations since baseline years.
+                    This linear regression models localized climate variables from Copernicus ERA5
+                    datasets. Slopes measure structural deviations since baseline years.
                   </p>
                 </div>
               </div>
             ) : (
-              <div className="py-20 text-center text-gray-500 text-xs">Failed to calculate trends.</div>
+              <div className="py-20 text-center text-gray-500 text-xs">
+                {fetchError
+                  ? "Couldn't load climate data for this location. Please try again."
+                  : "Failed to calculate trends."}
+              </div>
             )}
           </div>
         )}
@@ -503,12 +639,13 @@ export default function ClimateDashboard({
               </div>
             ) : (
               <div className="flex flex-col gap-4">
-                
                 {/* BEFORE / AFTER COMPARISON SLIDER */}
                 {localContributions.length >= 2 && (
                   <div className="flex flex-col gap-2">
-                    <h3 className="text-xs font-semibold text-gray-300">Before & After Climate Visualizer</h3>
-                    
+                    <h3 className="text-xs font-semibold text-gray-300">
+                      Before & After Climate Visualizer
+                    </h3>
+
                     {/* Visualizer selector */}
                     <div className="flex justify-between items-center text-[10px] text-gray-400 bg-black/30 p-1.5 rounded-lg border border-panel-border">
                       <button
@@ -574,16 +711,23 @@ export default function ClimateDashboard({
                       </div>
                     </div>
                     <p className="text-[10px] text-gray-500 text-center leading-normal mt-0.5">
-                      Drag the slider to compare environmental shift between <b>{localContributions[comparisonIndex * 2]?.date}</b> and <b>{localContributions[comparisonIndex * 2 + 1]?.date}</b>.
+                      Drag the slider to compare environmental shift between{" "}
+                      <b>{localContributions[comparisonIndex * 2]?.date}</b> and{" "}
+                      <b>{localContributions[comparisonIndex * 2 + 1]?.date}</b>.
                     </p>
                   </div>
                 )}
 
                 {/* Chronological Grid */}
-                <h3 className="text-xs font-semibold text-gray-300 mt-2">Regional Upload History</h3>
+                <h3 className="text-xs font-semibold text-gray-300 mt-2">
+                  Regional Upload History
+                </h3>
                 <div className="flex flex-col gap-3">
                   {localContributions.map((contrib) => (
-                    <div key={contrib.id} className="glass-card overflow-hidden flex flex-col md:flex-row gap-3 border border-panel-border p-2">
+                    <div
+                      key={contrib.id}
+                      className="glass-card overflow-hidden flex flex-col md:flex-row gap-3 border border-panel-border p-2"
+                    >
                       <img
                         src={contrib.imageUrl}
                         className="w-full md:w-28 h-20 object-cover rounded-lg border border-white/5 shrink-0"
@@ -596,7 +740,9 @@ export default function ClimateDashboard({
                             {contrib.date}
                           </span>
                         </div>
-                        <p className="text-[10px] text-gray-400 line-clamp-2 leading-relaxed">{contrib.description}</p>
+                        <p className="text-[10px] text-gray-400 line-clamp-2 leading-relaxed">
+                          {contrib.description}
+                        </p>
                         <div className="flex justify-between items-center text-[9px] text-gray-500 mt-auto pt-1 border-t border-white/5">
                           <span>By: {contrib.author}</span>
                           <span className="text-blue-400 font-medium">{contrib.category}</span>
@@ -615,75 +761,101 @@ export default function ClimateDashboard({
           <form onSubmit={handleUploadSubmit} className="flex flex-col gap-3">
             <h3 className="text-xs font-semibold text-gray-300">Contribute Climate Evidence</h3>
             <p className="text-[10px] text-gray-500 leading-normal -mt-1">
-              Upload photos showing glacier melts, droughts, deforestation, flooding, or successful ecological reclamation. Tied to this location: ({location.latitude.toFixed(3)}°, {location.longitude.toFixed(3)}°).
+              Upload photos showing glacier melts, droughts, deforestation, flooding, or successful
+              ecological reclamation. Tied to this location: ({location.latitude.toFixed(3)}°,{" "}
+              {location.longitude.toFixed(3)}°).
             </p>
 
             <div className="flex flex-col gap-1.5">
-              <label className="text-[10px] text-gray-400 uppercase tracking-wider">Photo Title *</label>
+              <label className="text-[10px] text-gray-400 uppercase tracking-wider">
+                Photo Title *
+              </label>
               <input
                 type="text"
                 required
                 placeholder="e.g. Rhone Glacier Recession"
                 value={uploadForm.title}
-                onChange={(e) => setUploadForm(p => ({ ...p, title: e.target.value }))}
+                onChange={(e) => setUploadForm((p) => ({ ...p, title: e.target.value }))}
                 className="bg-black/30 border border-panel-border rounded-lg px-3 py-2 text-xs text-white placeholder:text-gray-600 outline-none focus:border-blue-500"
               />
             </div>
 
             <div className="grid grid-cols-2 gap-3">
               <div className="flex flex-col gap-1.5">
-                <label className="text-[10px] text-gray-400 uppercase tracking-wider">Observation Date *</label>
+                <label className="text-[10px] text-gray-400 uppercase tracking-wider">
+                  Observation Date *
+                </label>
                 <input
                   type="date"
                   required
                   value={uploadForm.date}
-                  onChange={(e) => setUploadForm(p => ({ ...p, date: e.target.value }))}
+                  onChange={(e) => setUploadForm((p) => ({ ...p, date: e.target.value }))}
                   className="bg-black/30 border border-panel-border rounded-lg px-3 py-2 text-xs text-white outline-none focus:border-blue-500 cursor-pointer"
                 />
               </div>
 
               <div className="flex flex-col gap-1.5">
-                <label className="text-[10px] text-gray-400 uppercase tracking-wider">Category</label>
+                <label className="text-[10px] text-gray-400 uppercase tracking-wider">
+                  Category
+                </label>
                 <select
                   value={uploadForm.category}
-                  onChange={(e) => setUploadForm(p => ({ ...p, category: e.target.value }))}
+                  onChange={(e) => setUploadForm((p) => ({ ...p, category: e.target.value }))}
                   className="bg-black/30 border border-panel-border rounded-lg px-3 py-2 text-xs text-white outline-none focus:border-blue-500 cursor-pointer"
                 >
-                  <option value="Glacier Melt" className="bg-background">Glacier Melt</option>
-                  <option value="Drought" className="bg-background">Drought</option>
-                  <option value="Deforestation" className="bg-background">Deforestation</option>
-                  <option value="Flooding" className="bg-background">Flooding</option>
-                  <option value="Reclamation" className="bg-background">Ecology Action</option>
-                  <option value="Other" className="bg-background">Other</option>
+                  <option value="Glacier Melt" className="bg-background">
+                    Glacier Melt
+                  </option>
+                  <option value="Drought" className="bg-background">
+                    Drought
+                  </option>
+                  <option value="Deforestation" className="bg-background">
+                    Deforestation
+                  </option>
+                  <option value="Flooding" className="bg-background">
+                    Flooding
+                  </option>
+                  <option value="Reclamation" className="bg-background">
+                    Ecology Action
+                  </option>
+                  <option value="Other" className="bg-background">
+                    Other
+                  </option>
                 </select>
               </div>
             </div>
 
             <div className="flex flex-col gap-1.5">
-              <label className="text-[10px] text-gray-400 uppercase tracking-wider">Author Name / Credit</label>
+              <label className="text-[10px] text-gray-400 uppercase tracking-wider">
+                Author Name / Credit
+              </label>
               <input
                 type="text"
                 placeholder="e.g. Jean Dupont / NASA Archive"
                 value={uploadForm.author}
-                onChange={(e) => setUploadForm(p => ({ ...p, author: e.target.value }))}
+                onChange={(e) => setUploadForm((p) => ({ ...p, author: e.target.value }))}
                 className="bg-black/30 border border-panel-border rounded-lg px-3 py-2 text-xs text-white placeholder:text-gray-600 outline-none focus:border-blue-500"
               />
             </div>
 
             <div className="flex flex-col gap-1.5">
-              <label className="text-[10px] text-gray-400 uppercase tracking-wider">Description</label>
+              <label className="text-[10px] text-gray-400 uppercase tracking-wider">
+                Description
+              </label>
               <textarea
                 placeholder="Add scientific context or details showing environmental changes..."
                 rows={3}
                 value={uploadForm.description}
-                onChange={(e) => setUploadForm(p => ({ ...p, description: e.target.value }))}
+                onChange={(e) => setUploadForm((p) => ({ ...p, description: e.target.value }))}
                 className="bg-black/30 border border-panel-border rounded-lg px-3 py-2 text-xs text-white placeholder:text-gray-600 outline-none focus:border-blue-500 resize-none"
               />
             </div>
 
             {/* Photo Picker */}
             <div className="flex flex-col gap-1.5">
-              <label className="text-[10px] text-gray-400 uppercase tracking-wider">Upload Image *</label>
+              <label className="text-[10px] text-gray-400 uppercase tracking-wider">
+                Upload Image *
+              </label>
               <input
                 type="file"
                 accept="image/*"
@@ -691,13 +863,13 @@ export default function ClimateDashboard({
                 ref={fileInputRef}
                 className="hidden"
               />
-              
+
               {uploadForm.imagePreview ? (
                 <div className="relative aspect-video w-full rounded-lg overflow-hidden border border-panel-border group">
                   <img src={uploadForm.imagePreview} className="w-full h-full object-cover" alt="Preview" />
                   <button
                     type="button"
-                    onClick={() => setUploadForm(p => ({ ...p, imageFile: null, imagePreview: "" }))}
+                    onClick={() => setUploadForm((p) => ({ ...p, imageFile: null, imagePreview: "" }))}
                     className="absolute inset-0 bg-black/60 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-xs font-semibold text-white"
                   >
                     Change Image
