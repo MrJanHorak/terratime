@@ -19,7 +19,7 @@ import LocationSearch from "./components/LocationSearch";
 import ClimateDashboard from "./components/ClimateDashboard";
 import { LocationInfo, Contribution, ActiveLayers } from "./types";
 
-const YEARS = [1900, 1910, 1920, 1930, 1940, 1950, 1960, 1970, 1980, 1990, 2000, 2010, 2020, 2026];
+const YEARS = [1900, 1910, 1920, 1930, 1940, 1950, 1955, 1960, 1965, 1970, 1975, 1980, 1985, 1990, 1995, 2000, 2005, 2010, 2015, 2020, 2025, 2026];
 
 export default function Home() {
   const [mapboxToken, setMapboxToken] = useState("");

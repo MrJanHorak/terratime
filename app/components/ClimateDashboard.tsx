@@ -465,7 +465,7 @@ export default function ClimateDashboard({
                   }
                   className='bg-transparent text-white border border-panel-border rounded px-1.5 py-0.5 outline-none cursor-pointer'
                 >
-                  {[1950, 1960, 1970, 1980, 1990, 2000].map((y) => (
+                  {[1950, 1955, 1960, 1965,  1970, 1975, 1980, 1985, 1990, 1995, 2000, 2005, 2010, 2015, 2020].map((y) => (
                     <option key={y} value={y} className='bg-background'>
                       {y}
                     </option>
