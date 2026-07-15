@@ -62,30 +62,30 @@ export default function GlobeMap({
   const [mapLoaded, setMapLoaded] = useState(false);
 
   // Dynamically update NASA satellite basemap tiles to match the calendar timeline
-  useEffect(() => {
-    if (!mapRef.current || !mapLoaded) return;
+  // useEffect(() => {
+  //   if (!mapRef.current || !mapLoaded) return;
 
-    const map = mapRef.current;
-    const source = map.getSource(
-      'nasa-historical',
-    ) as mapboxgl.RasterTileSource;
+  //   const map = mapRef.current;
+  //   const source = map.getSource(
+  //     'nasa-historical',
+  //   ) as mapboxgl.RasterTileSource;
 
-    if (source) {
-      // 1. Generate the calendar target string
-      // Standardize a mid-season date (like June 15th for summer, Dec 15th for winter)
-      // or bind it to your slider month
-      const paddedMonth = String((currentYear % 12) + 1).padStart(2, '0');
-      const formattedDate = `${currentYear}-${paddedMonth}-15`;
+  //   if (source) {
+  //     // 1. Generate the calendar target string
+  //     // Standardize a mid-season date (like June 15th for summer, Dec 15th for winter)
+  //     // or bind it to your slider month
+  //     const paddedMonth = String((currentYear % 12) + 1).padStart(2, '0');
+  //     const formattedDate = `${currentYear}-${paddedMonth}-15`;
 
-      // 2. Set the new tile URL template
-      const newTiles = [
-        `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/${formattedDate}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`,
-      ];
+  //     // 2. Set the new tile URL template
+  //     const newTiles = [
+  //       `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/${formattedDate}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`,
+  //     ];
 
-      // This triggers Mapbox to gracefully swap out the background tiles in the background
-      source.setTiles(newTiles);
-    }
-  }, [currentYear, mapLoaded]);
+  //     // This triggers Mapbox to gracefully swap out the background tiles in the background
+  //     source.setTiles(newTiles);
+  //   }
+  // }, [currentYear, mapLoaded]);
 
   // Load global climate grid dataset
   useEffect(() => {

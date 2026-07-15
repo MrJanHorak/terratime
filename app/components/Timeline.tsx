@@ -142,6 +142,7 @@ export default function Timeline({
           onChange={(e) => setSpeed(parseInt(e.target.value))}
           className="bg-transparent text-xs text-gray-300 border border-panel-border rounded-lg px-2 py-1.5 focus:outline-none focus:border-blue-500 cursor-pointer"
         >
+          <option value={4000} className="bg-background">Super Slow (4s/yr)</option>
           <option value={2000} className="bg-background">Slow (2s/yr)</option>
           <option value={1000} className="bg-background">Normal (1s/yr)</option>
           <option value={500} className="bg-background">Fast (0.5s/yr)</option>
